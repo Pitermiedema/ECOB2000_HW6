@@ -1,0 +1,506 @@
+---
+title: "HW6: The Gender Wage Gap by Age, Occupation and Education"
+author: "Piter Miedema"
+output: html_document
+date: "2026-10-09"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r}
+library(ggplot2)
+library(tidyverse)
+library(haven)
+library(viridis)
+library(knitr)
+library(car)
+
+load("~/Downloads/acs2021_recoded.RData")
+dim(acs2021)
+```
+
+## Data and sample
+
+For this study, we will look at working age people (25 to 64), who are in the labor force, worked 48+ weeks, usually work 35+ hours per week and have an income.
+
+```{r}
+acs_work <- acs2021 %>%
+  filter(AGE >= 25, AGE <= 64,     # working age
+         LABFORCE == 2,            # in the labor force
+         WKSWORK2 >= 5,            # worked 48+ weeks last year
+         UHRSWORK >= 35,           # usually works 35+ hours a week
+         INCWAGE > 0)              # has wage income
+
+nrow(acs_work)
+rm(acs2021)   # drop the big dataset to free up memory
+gc()
+```
+
+Next, we will separate people into 3 educational categories: Advanced degree, College, Less than college.
+
+```{r}
+acs_work <- acs_work %>%
+  mutate(
+    sex = factor(ifelse(female == 1, "Women", "Men"), levels = c("Men", "Women")),
+    educ_group = case_when(
+      educ_advdeg  == 1 ~ "Advanced degree",
+      educ_college == 1 ~ "College",
+      TRUE              ~ "Less than college"),
+    educ_group = factor(educ_group,
+                        levels = c("Less than college", "College", "Advanced degree"))
+  )
+
+table(acs_work$SEX)                        # check: only Male and Female
+table(acs_work$educ_group, acs_work$sex)   # how many people in each cell
+```
+
+Next, we'll identify specific jobs. One glitch, people in the Management, Business & Financial group all list OCC = NA, so this will be one large job category. I chose the 21 largest occupation categories because I wanted physicians to be included.
+
+```{r}
+# Missing OCC = Management, Business & Financial (codes 0010-0960 are unlabeled in this file)
+acs_work <- acs_work %>%
+  mutate(occ = ifelse(is.na(OCC), "Management & Business", as.character(OCC)))
+
+# The 21 most common occupations in the sample
+top21 <- acs_work %>%
+  count(occ, sort = TRUE) %>%
+  head(21)
+kable(top21)
+
+# Keep those 21, put everyone else in "Other", and shorten the long names for graphs
+acs_work <- acs_work %>%
+  mutate(profession = ifelse(occ %in% top21$occ, occ, "Other"),
+         profession = dplyr::recode(profession,
+                             "Driver/sales workers and truck drivers" = "Truck drivers",
+                             "First-Line supervisors of retail sales workers" = "Retail sales supervisors",
+                             "Secretaries and administrative assistants, except legal, medical, and executive" = "Secretaries & admin assistants",
+                             "Laborers and freight, stock, and material movers, hand" = "Laborers & material movers",
+                             "Sales representatives, wholesale and manufacturing" = "Sales reps, wholesale & mfg",
+                             "First-Line supervisors of office and administrative support workers" = "Office & admin supervisors",
+                             "First-Line supervisors of non-retail sales workers" = "Non-retail sales supervisors",
+                             "Bookkeeping, accounting, and auditing clerks" = "Bookkeeping clerks",
+                             "Other physicians" = "Physicians",
+                             "Elementary and middle school teachers" = "Elementary & middle school teachers",
+                             "Janitors and building cleaners" = "Janitors & building cleaners"))
+
+table(acs_work$profession)
+```
+
+## Raw wage gap by occupation and education
+
+What follows is the raw wage gap by profession and education. Groups with \<1000 were left out (janitors with advanced degrees, for example).
+
+```{r}
+# Gap for each profession (all education levels together)
+gap_prof <- acs_work %>%
+  filter(profession != "Other") %>%
+  group_by(profession) %>%
+  summarize(n_men     = sum(sex == "Men"),
+            n_women   = sum(sex == "Women"),
+            avg_men   = mean(INCWAGE[sex == "Men"]),
+            avg_women = mean(INCWAGE[sex == "Women"]),
+            ratio     = avg_women / avg_men) %>%
+  arrange(ratio)
+
+kable(gap_prof, digits = 2, format.args = list(big.mark = ","),
+      caption = "Average wage by sex and profession (ratio = women / men)")
+
+# Same thing split by education, keeping only groups with 1000+ men AND 1000+ women
+gap_prof_educ <- acs_work %>%
+  filter(profession != "Other") %>%
+  group_by(profession, educ_group) %>%
+  summarize(n_men     = sum(sex == "Men"),
+            n_women   = sum(sex == "Women"),
+            avg_men   = mean(INCWAGE[sex == "Men"]),
+            avg_women = mean(INCWAGE[sex == "Women"]),
+            ratio     = avg_women / avg_men,
+            .groups = "drop") %>%
+  filter(n_men >= 1000, n_women >= 1000)
+
+kable(gap_prof_educ, digits = 2, format.args = list(big.mark = ","),
+      caption = "Average wage by sex, profession and education (groups with 1000+ of each sex)")
+```
+
+It appears that across professions and accounting for educational level there exists a raw wage gap. The gap is smallest among teachers (both elementary and HS) and nurses, where women make \>90% of what men make, and greatest among retail salespeople with less than college (66%), retail sales supervisors (68%) and all management and business professions at all educational levels (69% to 72%). Janitors and cleaners with less than college also comes in at 72%. In general, education doesn't narrow the raw gap significantly except in the case of retail sales supervisors, where women with less than college make 68% of men, while women with a college degree make 80% as much.
+
+## Wage gap by age
+
+Next, we'll look at wage gap by age.
+
+```{r}
+acs_work <- acs_work %>%
+  mutate(sector = case_when(
+    profession %in% c("Management & Business", "Lawyers", "Physicians", "Software developers",
+                      "Postsecondary teachers", "Registered nurses",
+                      "Elementary & middle school teachers", "Secondary school teachers") ~ "Professional",
+    profession %in% c("Retail salespersons", "Retail sales supervisors", "Non-retail sales supervisors",
+                      "Sales reps, wholesale & mfg", "Customer service representatives",
+                      "Secretaries & admin assistants", "Office & admin supervisors",
+                      "Bookkeeping clerks") ~ "Sales & Office",
+    profession %in% c("Truck drivers", "Laborers & material movers", "Janitors & building cleaners",
+                      "Construction laborers", "Other production workers") ~ "Manual",
+    TRUE ~ "Other"))
+
+table(acs_work$sector, acs_work$sex)
+```
+
+```{r}
+by_age_prof <- acs_work %>%
+  filter(profession != "Other") %>%
+  group_by(profession, sex, AGE) %>%
+  summarize(avg_wage = mean(INCWAGE), .groups = "drop")
+
+plot_prof <- function(which_prof) {
+  ggplot(filter(by_age_prof, profession == which_prof),
+         aes(x = AGE, y = avg_wage, color = sex)) +
+    geom_point(size = 2, alpha = 0.5) +
+    geom_smooth(method = "lm", formula = y ~ x + I(x^2), se = FALSE, linewidth = 1.2) +
+    scale_color_viridis_d(option = "inferno", end = 0.7) +
+    scale_y_continuous(labels = scales::label_dollar(scale = 1/1000, suffix = "k")) +
+    labs(x = "Age", y = "Average wage", color = NULL,
+         title = which_prof,
+         subtitle = "Dots = average wage at each age; lines = quadratic fit (age + age squared)") +
+    theme_minimal(base_size = 14) +
+    theme(legend.position = "top")
+}
+plot_prof("Management & Business")
+```
+
+```{r}
+for (p in sort(unique(by_age_prof$profession))) {
+  print(plot_prof(p))
+}
+```
+
+The age profiles show two distinct patterns. In lower-wage manual and clerical jobs (truck drivers, janitors, production workers, retail salespersons, secretaries), women earn 20–30% less than men already at ages 25–29, and the gap stays roughly the same over the career. In professional and supervisory jobs, men and women start at nearly equal pay: female lawyers, physicians, and software developers earn 94–96% of what men earn in their late 20s. But the gap opens up in the 30s, and by ages 40–49 women in these jobs earn only about 78–80% of what men earn. The timing coincides with the typical age of having children, which is consistent with a “motherhood penalty”. Teachers and nurses, where pay is set largely by salary scales, show small and stable gaps throughout.
+
+Note: this is a single cross-section, so differences across ages also reflect cohort differences (women aged 45 in 2021 started their careers under different conditions than women aged 27), not only how individual careers evolve.
+
+## Age, Age² and higher-order terms
+
+Next, a regression of wage on age, age squared, sex, education and occupation.
+
+```{r}
+acs_work$profession <- relevel(factor(acs_work$profession), ref = "Other")
+
+model1 <- lm(INCWAGE ~ AGE + I(AGE^2) + female + educ_college + educ_advdeg + profession,
+             data = acs_work)
+summary(model1)
+
+b <- coef(model1)
+peak_age <- -b["AGE"] / (2 * b["I(AGE^2)"])
+peak_age
+```
+
+Next, we'll test whether higher order age terms add information.
+
+```{r}
+model2 <- lm(INCWAGE ~ AGE + I(AGE^2) + I(AGE^3) + I(AGE^4) +
+               female + educ_college + educ_advdeg + profession,
+             data = acs_work)
+summary(model2)$coefficients[1:5, ]
+
+# Joint F-test: are AGE^3 and AGE^4 both zero?
+linearHypothesis(model2, c("I(AGE^3) = 0", "I(AGE^4) = 0"))
+
+# Same test a second way: compare the two models directly
+anova(model1, model2)
+
+# Does it improve the fit much?
+c(R2_quadratic = summary(model1)$r.squared, R2_quartic = summary(model2)$r.squared)
+```
+
+```{r}
+# Predicted wage by age from both models, for one example person:
+# a man with a college degree in Management & Business
+pred_data <- data.frame(AGE = 25:64, female = 0, educ_college = 1, educ_advdeg = 0,
+                        profession = "Management & Business")
+pred_data$quadratic <- predict(model1, pred_data)
+pred_data$quartic   <- predict(model2, pred_data)
+
+pred_data %>%
+  pivot_longer(c(quadratic, quartic), names_to = "model", values_to = "pred") %>%
+  ggplot(aes(x = AGE, y = pred, color = model)) +
+  geom_line(linewidth = 1.2) +
+  scale_color_viridis_d(end = 0.7) +
+  scale_y_continuous(labels = scales::label_dollar(scale = 1/1000, suffix = "k")) +
+  labs(x = "Age", y = "Predicted wage", color = NULL,
+       title = "Predicted wage: quadratic vs quartic in age",
+       subtitle = "Man, college degree, Management & Business") +
+  theme_minimal(base_size = 14) + theme(legend.position = "top")
+
+pred_data$AGE[which.max(pred_data$quartic)]   # peak age in the quartic model
+```
+
+AGE³ and AGE⁴ are jointly statistically significant (F = 96.5, p < 0.001), but R² goes up by only 0.0002 and the predicted curves are nearly identical. With 881,000 observations even tiny differences are significant, so the quadratic is good enough.
+
+## log(Age)
+
+Next we'll try log(Age) instead of a polynomial.
+
+```{r}
+# (a) log(Age) alone
+model3 <- lm(INCWAGE ~ log(AGE) + female + educ_college + educ_advdeg + profession,
+             data = acs_work)
+summary(model3)$coefficients[1:3, ]
+
+# (b) a polynomial in log(Age): log(Age) + log(Age)^2
+model4 <- lm(INCWAGE ~ log(AGE) + I(log(AGE)^2) + female + educ_college + educ_advdeg + profession,
+             data = acs_work)
+summary(model4)$coefficients[1:4, ]
+
+# Compare the fit of the three models
+c(quadratic_age = summary(model1)$r.squared,
+  log_age       = summary(model3)$r.squared,
+  log_age_sq    = summary(model4)$r.squared)
+
+# Why polynomials in log(Age) add little: these are almost the same variable
+cor(acs_work$AGE, log(acs_work$AGE))
+cor(log(acs_work$AGE), log(acs_work$AGE)^2)
+```
+
+```{r}
+pred_data$log_age    <- predict(model3, pred_data)
+pred_data$log_age_sq <- predict(model4, pred_data)
+
+pred_data %>%
+  pivot_longer(c(quadratic, log_age, log_age_sq), names_to = "model", values_to = "pred") %>%
+  ggplot(aes(x = AGE, y = pred, color = model)) +
+  geom_line(linewidth = 1.2) +
+  scale_color_viridis_d(end = 0.8) +
+  scale_y_continuous(labels = scales::label_dollar(scale = 1/1000, suffix = "k")) +
+  labs(x = "Age", y = "Predicted wage", color = NULL,
+       title = "Predicted wage: Age + Age² vs log(Age) vs log(Age) + log(Age)²",
+       subtitle = "Man, college degree, Management & Business") +
+  theme_minimal(base_size = 14) + theme(legend.position = "top")
+```
+
+log(Age) captures the idea that wages grow fast early in a career and then level off, using a single coefficient. But it cannot capture the decline in wages after the early 50s, so it fits worse than Age + Age². Adding log(Age)² restores the hump, but over ages 25–64 log(Age) is nearly linear in Age, so this just reproduces the quadratic in a less interpretable form.
+
+## Children and the wage gap
+
+Next, we'll look into the "motherhood penalty." Only ages 25 to 45 are included as that is most likely when a mother would have a child in the household. This regression compares mothers and non-mothers at the same age and education level by occupation.
+
+```{r}
+# has_child = 1 if the person has at least one of their own children living at home
+acs_work <- acs_work %>%
+  mutate(has_child = as.numeric(NCHILD > 0))
+
+# Ages 25-45 only: older parents' children have often moved out
+acs_young <- acs_work %>% filter(AGE <= 45)
+
+# Average wage for the four groups
+acs_young %>%
+  group_by(sex, has_child) %>%
+  summarize(n = n(), avg_wage = mean(INCWAGE), .groups = "drop") %>%
+  kable(digits = 0, format.args = list(big.mark = ","))
+```
+
+```{r}
+# Raw averages: women with vs. without children, ages 25-45
+kids_prof <- acs_young %>%
+  filter(profession != "Other") %>%
+  group_by(profession) %>%
+  summarize(n_mothers        = sum(sex == "Women" & has_child == 1),
+            n_women_nokids   = sum(sex == "Women" & has_child == 0),
+            avg_mothers      = mean(INCWAGE[sex == "Women" & has_child == 1]),
+            avg_women_nokids = mean(INCWAGE[sex == "Women" & has_child == 0]),
+            ratio_women      = avg_mothers / avg_women_nokids,
+            ratio_men        = mean(INCWAGE[sex == "Men" & has_child == 1]) /
+              mean(INCWAGE[sex == "Men" & has_child == 0])) %>%
+  arrange(ratio_women)
+
+kable(kids_prof, digits = 2, format.args = list(big.mark = ","),
+      caption = "Raw: wage with kids / wage without kids, ages 25-45")
+```
+
+```{r}
+# Same comparison, controlling for age and education, run separately for each profession
+kids_effect <- acs_young %>%
+  filter(profession != "Other") %>%
+  group_by(profession) %>%
+  group_modify(~ {
+    m <- lm(log(INCWAGE) ~ AGE + I(AGE^2) + female + has_child + I(female * has_child) +
+              educ_college + educ_advdeg, data = .x)
+    b <- coef(m)
+    tibble(father_effect = exp(b["has_child"]) - 1,
+           mother_effect = exp(b["has_child"] + b["I(female * has_child)"]) - 1)
+  }) %>%
+  ungroup() %>%
+  arrange(mother_effect)
+
+kable(kids_effect, digits = 3,
+      caption = "Wage difference from having children, controlling for age and education (log model)")
+```
+
+In every profession, children are associated with higher pay for men than women. The father effect ranges from +1% to +31% while the mother effect is from -16% to +15%. In most jobs, mothers earn about the same as or a bit less than women without kids, while fathers earn 10-30% more than men without kids. It appears that the "motherhood penalty" is more of a "fatherhood bonus." Management and business shows the biggest gap with fathers at +17% and mothers at 0%. Software developers have the clearest penalty for mom (-9%) and almost no premium for fathers (+3%). Physicians and lawyers show the largest gains for mothers (+15%, +8%), but still well below fathers (+31%, +18%).
+
+## Dummy variables
+
+Next, some experiments with dummy variables, using only college graduates.
+
+```{r}
+acs_coll <- acs_work %>% filter(educ_college == 1 | educ_advdeg == 1)
+
+coef(lm(INCWAGE ~ AGE + I(AGE^2) + female + educ_hs, data = acs_coll))
+coef(lm(INCWAGE ~ AGE + I(AGE^2) + female + educ_college, data = acs_coll))
+coef(lm(INCWAGE ~ AGE + I(AGE^2) + female + educ_college + educ_advdeg, data = acs_coll))
+coef(lm(INCWAGE ~ AGE + I(AGE^2) + female + I(female^2), data = acs_coll))
+```
+
+In a sample of only college graduates, educ_hs is 0 for everyone, so it has no variation and R reports NA. With only educ_college in the model, the base group is advanced degree, so its coefficient (−29,017) means BA holders earn about $29,000 less than people with an advanced degree. Putting both educ_college and educ_advdeg in is the dummy variable trap: every person has exactly one of them, so together they duplicate the intercept and R drops one. Squaring a dummy is pointless because 0² = 0 and 1² = 1, so female² is identical to female. Similarly, because the sample is restricted to full-time workers in the labor force, a dummy for being in the labor force would have no variation.
+
+## Log wage model with gender–age interactions
+
+Next, we'll see if log(INCWAGE) gives a better fit to the data.
+
+```{r}
+model_int <- lm(log(INCWAGE) ~ AGE + I(AGE^2) + female + I(female * AGE) + I(female * AGE^2) +
+                  educ_college + educ_advdeg + profession,
+                data = acs_work)
+summary(model_int)$coefficients[1:6, ]
+
+# Are the two interaction terms jointly significant?
+linearHypothesis(model_int, c("I(female * AGE) = 0", "I(female * AGE^2) = 0"))
+
+# Peak age for men and for women
+bi <- coef(model_int)
+peak_men   <- -bi["AGE"] / (2 * bi["I(AGE^2)"])
+peak_women <- -(bi["AGE"] + bi["I(female * AGE)"]) /
+  (2 * (bi["I(AGE^2)"] + bi["I(female * AGE^2)"]))
+c(men = unname(peak_men), women = unname(peak_women))
+
+```
+
+```{r}
+# Log wage model without interactions (same variables as model1, but log wage)
+model_log <- lm(log(INCWAGE) ~ AGE + I(AGE^2) + female + educ_college + educ_advdeg + profession,
+                data = acs_work)
+
+# Compare R-squared: dollars vs log vs log with interactions
+c(dollar_model     = summary(model1)$r.squared,
+  log_model        = summary(model_log)$r.squared,
+  log_interactions = summary(model_int)$r.squared)
+
+# Effects in the log model as percentages
+bl <- coef(model_log)
+exp(bl[c("female", "educ_college", "educ_advdeg")]) - 1
+```
+
+The log wage model has a higher R² (0.31 vs 0.25), so it explains more of the variation in wages. In the log model, women earn about 25% less than men with the same age, education and profession. Adding female × Age and female × Age² barely changes R², but the interaction terms are jointly highly significant (F ≈ 470) and change the shape: women’s wages rise more slowly with age, so the gap widens over a career.
+
+Finally, we'll look at a log wage model with gender-age interactions for each occupation.
+
+```{r}
+# Run the interaction model separately in each profession, and predict wages at every age
+pred_all <- acs_work %>%
+  filter(profession != "Other") %>%
+  group_by(profession) %>%
+  group_modify(~ {
+    m <- lm(log(INCWAGE) ~ AGE + I(AGE^2) + female + I(female * AGE) + I(female * AGE^2) +
+              educ_college + educ_advdeg, data = .x)
+    common_educ <- names(which.max(table(.x$educ_group)))   # most common education in this job
+    newdata <- expand.grid(AGE = 25:64, female = c(0, 1))
+    newdata$educ_college <- as.numeric(common_educ == "College")
+    newdata$educ_advdeg  <- as.numeric(common_educ == "Advanced degree")
+    newdata$educ_used    <- common_educ
+    newdata$pred         <- exp(predict(m, newdata))
+    newdata
+  }) %>%
+  ungroup() %>%
+  mutate(sex = ifelse(female == 1, "Women", "Men"))
+
+# Women's predicted wage / men's, at ages 25, 35, 45, 55
+ratios <- pred_all %>%
+  filter(AGE %in% c(25, 35, 45, 55)) %>%
+  select(profession, educ_used, AGE, sex, pred) %>%
+  pivot_wider(names_from = sex, values_from = pred) %>%
+  mutate(ratio = Women / Men) %>%
+  select(profession, educ_used, AGE, ratio) %>%
+  pivot_wider(names_from = AGE, names_prefix = "age_", values_from = ratio) %>%
+  arrange(age_55)
+
+kable(ratios, digits = 2,
+      caption = "Women's predicted wage as a share of men's, by profession and age")
+```
+
+```{r}
+plot_int <- function(which_prof) {
+  d <- filter(pred_all, profession == which_prof)
+  ggplot(d, aes(x = AGE, y = pred, color = sex)) +
+    geom_line(linewidth = 1.2) +
+    scale_color_viridis_d(option = "inferno", end = 0.7) +
+    scale_y_continuous(labels = scales::label_dollar(scale = 1/1000, suffix = "k")) +
+    labs(x = "Age", y = "Predicted wage", color = NULL, title = which_prof,
+         subtitle = paste0("Log model with female x Age and female x Age² (", d$educ_used[1], ")")) +
+    theme_minimal(base_size = 14) + theme(legend.position = "top")
+}
+
+for (p in ratios$profession) {
+  print(plot_int(p))
+}
+```
+
+This model follows a similar pattern. The wage gap opens with age in most professions. Physicians go from 98% at 25 to 75% at 55. Lawyers go from 108% (young women out earn young men) to 77% and Management and Business from 90% to 72%. In most manual jobs the gap is there from the start and remains fairly constant. The gap stays small and steady for teachers and nurses (88% to 95% throughout).
+
+## Predicted values
+
+Using this final model, we can look at some predicted values.
+
+```{r}
+# Fit the log wage model with gender-age interactions within one profession,
+# then predict for a man and a woman at ages 28 and 50
+predict_cases <- function(which_prof, educ) {
+  m <- lm(log(INCWAGE) ~ AGE + I(AGE^2) + female + I(female * AGE) + I(female * AGE^2) +
+            educ_college + educ_advdeg,
+          data = filter(acs_work, profession == which_prof))
+  newdata <- expand.grid(AGE = c(28, 50), female = c(0, 1))
+  newdata$educ_college <- as.numeric(educ == "College")
+  newdata$educ_advdeg  <- as.numeric(educ == "Advanced degree")
+  newdata$pred <- exp(predict(m, newdata))
+  newdata %>%
+    mutate(sex = ifelse(female == 1, "Women", "Men")) %>%
+    select(AGE, sex, pred) %>%
+    pivot_wider(names_from = sex, values_from = pred) %>%
+    mutate(profession = which_prof, education = educ,
+           gap = Men - Women, ratio = Women / Men) %>%
+    select(profession, education, AGE, Men, Women, gap, ratio)
+}
+
+cases <- bind_rows(
+  predict_cases("Postsecondary teachers",       "Advanced degree"),
+  predict_cases("Lawyers",                      "Advanced degree"),
+  predict_cases("Secondary school teachers",    "Advanced degree"),
+  predict_cases("Janitors & building cleaners", "Less than college"))
+
+kable(cases, digits = 2, format.args = list(big.mark = ","),
+      caption = "Predicted wages from the log wage model with gender-age interactions")
+```
+
+```{r}
+# Sanity check: actual median wages for the same groups (ages 26-30 and 48-52)
+acs_work %>%
+  filter(profession %in% unique(cases$profession),
+         AGE %in% 26:30 | AGE %in% 48:52) %>%
+  mutate(age_group = ifelse(AGE <= 30, "26-30", "48-52")) %>%
+  group_by(profession, age_group, sex) %>%
+  summarize(median_wage = median(INCWAGE), n = n(), .groups = "drop") %>%
+  pivot_wider(names_from = sex, values_from = c(median_wage, n)) %>%
+  kable(format.args = list(big.mark = ","))
+```
+
+The predictions are reasonable. They’re close to the actual medians, and in every case they show the same pattern: who’s ahead at 28, and whether the gap grows by 50. The model runs a bit higher for professors and lawyers, partly because the model assumes an advanced degree for everyone, while the raw medians include everyone in the job.
+
+## Discussion
+
+**Do the variables have the expected signs?** Yes. Wages rise with age and then flatten and decline (positive Age, negative Age²), peaking around age 53. This fits the idea that workers gain skills and experience early in their careers, and that gains slow down later. Education has large positive effects: in the log model, a college degree is associated with about 50% higher wages and an advanced degree with about 87%, compared with less than college. Occupation matters a great deal: physicians and lawyers earn far more than janitors or truck drivers at the same age and education. The female coefficient is negative and highly significant in every specification. Women earn about 25% less than men with the same age, education and occupation.
+
+**Is there a plausible causal link from X to Y?** For age and sex, the direction is clear: earning more cannot change your age or sex. But that does not mean the female coefficient measures discrimination alone. It also captures differences we do not observe, such as hours worked beyond 35 per week, job tasks within an occupation, employer, and time out of the labor force. Some of those differences may themselves result from discrimination or social expectations. For education the direction is less clean: people with more ability or ambition may be more likely to get degrees *and* to earn more, so the education coefficients probably overstate the true effect of schooling. For children, the link could run both ways: higher-earning men may be more likely to have children, and women on demanding career tracks may delay them. Finally, the sample includes only full-time, full-year workers. Women who cut back hours or left work after having children are not in it, so the gaps reported here probably understate the full gap in earnings.
+
+**A single cross-section.** All results come from one year of data (2021). When I compare a 28-year-old with a 50-year-old, I am comparing two different people from two different generations, not the same person at two points in her career. The 50-year-old woman started her career around 1995, under different conditions, norms and laws than the 28-year-old, who started around 2015. So part of what looks like "the gap opening with age" may be a **generational (cohort) effect**: older women may have faced a larger gap all along, while younger women may face a smaller one that does not widen as much as they age.
+
+It would be very interesting to repeat this analysis with the same data from 20 and 40 years ago (for example, the 2000 and 1980 Census samples). That would show whether today's 50-year-old women already had a gap at age 28, and whether the gap for young workers has been shrinking over time.
+
+**Is the gap disappearing?** Much has been made of the gender wage gap, and these results suggest it is disappearing for some groups but not others. Among young, highly educated professionals, it has largely closed: at age 28, female lawyers and college professors earn as much as or slightly more than men in the same jobs, and young teachers and nurses earn close to the same. But a gap still opens over the course of professional careers, especially in law, medicine, management and sales, in the years when most workers have young children. Mothers earn about the same as women without children, while fathers earn 10–30% more than men without children. In lower-wage manual and service jobs, such as janitors, truck drivers and production workers, women earn 20–30% less than men from the very start, and that gap remains fairly constant. So the progress appears concentrated among young, college-educated women, while the gap remains for women in lower-wage jobs and for women in professional careers once family responsibilities begin.
